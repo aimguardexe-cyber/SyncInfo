@@ -1,3 +1,4 @@
+import asyncio
 from app.proto import output_pb2, personalInfo_pb2
 import httpx
 import json
@@ -79,16 +80,36 @@ def build_headers(token):
         'ReleaseVersion': RELEASE_VERSION
     }
 
-async def GetAccountInformation(ID, UNKNOWN_ID, endpoint):
-    """Get account information from Free Fire API"""
-    try:
-        # Create JSON payload
-        json_data = json.dumps({
-            "a": ID,
-            "b": UNKNOWN_ID
-        })
+async def fetch_account_for_region(client, region, token, json_data, endpoint):
+    """Helper function to fetch account data for a single region"""
+    server_url = get_url(region)
+    headers = build_headers(token)
+    encoded_result = await json_to_proto(json_data, output_pb2.PlayerInfoByLokesh())
+    payload = aes_cbc_encrypt(MAIN_KEY, MAIN_IV, encoded_result)
+    
+    response = await client.post(server_url + endpoint, data=payload, headers=headers)
+    response.raise_for_status()
+    
+    message = decode_protobuf(response.content, personalInfo_pb2.PersonalInfoByLokesh)
+    
+    if hasattr(message, 'developer_info'):
+        dev_info = personalInfo_pb2.DeveloperInfo()
+        dev_info.developer_name = "@lokeshpkz"  
+        dev_info.portfolio = "https://nexxlokesh.in"
+        dev_info.github = "https://github.com/lokeshpkz"
+        dev_info.youtube = "@aimguardexe"
+        dev_info.signature = "Aimguard — I don't write code. I write legacy."
+        dev_info.do_not_remove_credits = True
+        message.developer_info.CopyFrom(dev_info)
         
-        # Get tokens from database
+    return json.loads(json_format.MessageToJson(message))
+
+
+async def GetAccountInformation(ID, UNKNOWN_ID, endpoint):
+    """Get account information from Free Fire API concurrently"""
+    try:
+        json_data = json.dumps({"a": ID, "b": UNKNOWN_ID})
+        
         tokens = get_jwt_tokens()
         if not tokens:
             return {
@@ -96,53 +117,55 @@ async def GetAccountInformation(ID, UNKNOWN_ID, endpoint):
                 "message": "Service temporarily unavailable"
             }
 
-        # Try regions in priority order
         region_priority = ["bd", "pk", "ind", "na"]
         
-        for region in region_priority:
-            token = tokens.get(region)
-            if not token:
-                continue
+        # HTTP Client Reuse (Connection Pooling) inside this call
+        async with httpx.AsyncClient() as client:
+            tasks = []
+            
+            for region in region_priority:
+                token = tokens.get(region)
+                if token:
+                    tasks.append(asyncio.create_task(
+                        fetch_account_for_region(client, region, token, json_data, endpoint)
+                    ))
+            
+            if not tasks:
+                return {"error": "All regions failed", "message": "No tokens available for any region"}
                 
-            try:
-                # Prepare request data
-                server_url = get_url(region)
-                headers = build_headers(token)
-                encoded_result = await json_to_proto(json_data, output_pb2.PlayerInfoByLokesh())
-                payload = aes_cbc_encrypt(MAIN_KEY, MAIN_IV, encoded_result)
+            fallback_response = None
+            
+            # Parallel Requests Execution
+            while tasks:
+                # Wait for FIRST completed task
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 
-                # Make API request
-                async with httpx.AsyncClient() as client:
-                    response = await client.post(server_url + endpoint, data=payload, headers=headers)
-                    response.raise_for_status()
-                    
-                    # Decode response
-                    message = decode_protobuf(response.content, personalInfo_pb2.PersonalInfoByLokesh)
-                    
-                    if hasattr(message, 'developer_info'):
-                        # Create developer info object
-                        dev_info = personalInfo_pb2.DeveloperInfo()
-                        dev_info.developer_name = "@lokeshpkz"  
-                        dev_info.portfolio = "https://nexxlokesh.in"
-                        dev_info.github = "https://github.com/lokeshpkz"
-                        dev_info.youtube = "@aimguardexe"
-                        dev_info.signature = "Aimguard — I don't write code. I write legacy."
-                        dev_info.do_not_remove_credits = True
+                for task in done:
+                    try:
+                        result_json = task.result()
+                        fallback_response = result_json
                         
-                        # Assign to message
-                        message.developer_info.CopyFrom(dev_info)
-                    
-                    return json.loads(json_format.MessageToJson(message))
-                    
-            except Exception as e:
-                # Continue to next region if current one fails
-                continue
-        
-        # If all regions failed
-        return {
-            "error": "All regions failed",
-            "message": "Unable to fetch account information"
-        }
+                        # Check if data is complete
+                        if result_json.get("socialInfo") and result_json.get("creditScoreInfo"):
+                            # We got full data! Cancel remaining tasks to save bandwidth/resources
+                            for p in pending:
+                                p.cancel()
+                            return result_json
+                    except Exception:
+                        pass
+                
+                # Update tasks list with remaining pending tasks
+                tasks = list(pending)
+                
+            # If no region had complete data, but we at least got some partial data
+            if fallback_response:
+                return fallback_response
+                
+            # If all regions failed completely
+            return {
+                "error": "All regions failed",
+                "message": "Unable to fetch account information"
+            }
 
     except Exception as e:
         return {
