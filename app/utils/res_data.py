@@ -48,7 +48,7 @@ def decode_protobuf(encoded_data: bytes, message_type: message.Message) -> messa
 
 def get_jwt_tokens():
     """Get JWT tokens from database for allowed regions"""
-    allowed_regions = {"bd", "pk", "ind", "us"}
+    allowed_regions = {"bd", "pk", "ind", "na"}
     tokens_cursor = tokens_collection.find({"region": {"$in": list(allowed_regions)}})
     
     tokens = {}
